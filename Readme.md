@@ -49,4 +49,4 @@ program's window.
 ## Credits
 
 ips was created by [Dmitrii Toksaitov](https://github.com/toksaitov).
-
+ips was edited by [Begimai Amantaeva](https://github.com/begimai).

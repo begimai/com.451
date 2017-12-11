@@ -2,7 +2,16 @@
     ips.c
 
     Created by Dmitrii Toksaitov, 2013
+    Edited by Begimai Amantaeva, 2017
 */
+
+// The producer's task is to generate a piece of data, put it into the buffer and start again
+// The consumer is consuming the data(removing from the buffer) one piece at a time
+//
+// Consumer removes data and notifies the producer, who starts filling the buffer again
+// Consumer can go to sleep if buffer is empty
+// When producer puts data, it wakes up consumer
+
 
 #pragma mark - Standard Includes
 
@@ -53,6 +62,7 @@ static const char *Vertex_Shader_Path   = "ips_shader.glsl.vs",
 static const float Initial_Camera_Zoom = 0.8f,
                    Camera_Speed = 0.01f,
                    Camera_Minimum_Zoom = 0.01f;
+
 
 #pragma mark - Data Types
 
@@ -105,12 +115,14 @@ ips_raw_image_t *ips_duplicate_image(ips_raw_image_t *image);
 void ips_delete_image(ips_raw_image_t *image);
 
 void reset_pass_data(void);
+void pool_push(ips_task_t *task);
+void pool_pop(void);
 void ips_update_image_data(ips_raw_image_t *image, float dt);
 void ips_create_image_processing_task_pool();
 void *ips_thread_process_image_part(void *args);
 
 void ips_set_brightness_and_contrast(ips_task_t *task);
-// TODO: add a Sobel filter function prototype
+void ips_set_sobel_filter(ips_task_t *task);
 
 GLuint ips_create_texture_from_image(ips_raw_image *image);
 void ips_update_texture_from_image(GLuint texture, ips_raw_image *image);
@@ -165,25 +177,33 @@ static float maximum_channel_value = 0.0f;
 /* Threading Data */
 
 static ips_task_pool_t *pool;
-
 static int number_of_threads = 0;
+static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t is_pool_empty_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t is_last_row_completed_cond = PTHREAD_COND_INITIALIZER;
 
 #pragma mark - Function Definitions
 
 void ips_create_image_processing_task_pool()
 {
-    pool =
-        (ips_task_pool_t*) malloc(sizeof(*pool));
+    pool = (ips_task_pool_t*) malloc(sizeof(*pool));
 
     pool->first_task = NULL;
     pool->last_task  = NULL;
     pool->size = 0;
 
-    number_of_threads =
-        ips_utils_get_number_of_cpu_cores();
+    number_of_threads = ips_utils_get_number_of_cpu_cores();
 
     for (int i = 0; i < number_of_threads; ++i) {
-        // TODO
+        pthread_t thread;
+        if (0 != pthread_create(
+                &thread,
+                NULL,
+                ips_thread_process_image_part,
+                pool
+            )) {
+            fputs("Failed to create a consumer thread.\n", stderr);
+        }
     }
 }
 
@@ -191,6 +211,34 @@ void reset_pass_data()
 {
     minimum_channel_value = 0.0f;
     maximum_channel_value = 0.0f;
+}
+
+
+void pool_push(ips_task_t *task)
+{
+    printf("push\n");
+    if (!pool->first_task) {
+        pool->first_task = task;
+    }
+
+    if (pool->last_task) {
+        pool->last_task->next_task = task;
+    }
+
+    // pool->last_task = task;
+    pool->size++;
+}
+
+
+void pool_pop()
+{
+    printf("pop\n");
+    ips_task_t *task = pool->first_task;
+    pool->first_task = task->next_task;
+    pool->size--;
+    if (!pool->size) {
+        pool->last_task = NULL;
+    }
 }
 
 /* Producer tasks: called each time before rendering a frame. */
@@ -205,79 +253,57 @@ void ips_update_image(
 {
     for (png_uint_32 y = 0; y < image->height; y += number_of_threads) {
         for (png_uint_32 i = 0; i < number_of_threads && ((y + i) < image->height); ++i) {
-            png_uint_32 current_row_index =
-                y + i;
-
+            png_uint_32 current_row_index = y + i;
             ips_task_t *task;
-            task =
-                (ips_task_t *) malloc(sizeof(*task));
-            task->input_image =
-                source_image;
-            task->output_image =
-                image;
-            task->row_index_to_process =
-                current_row_index;
-            task->last_row_index_to_process =
-                current_row_index + 1;
-            task->image_processing_parameters =
-                image_processing_parameters;
-            task->image_processing_function =
-                image_processing_function;
-            task->pass =
-                pass;
-
+            task = (ips_task_t *) malloc(sizeof(*task));
+            task->input_image = source_image;
+            task->output_image = image;
+            task->row_index_to_process = current_row_index;
+            task->last_row_index_to_process = current_row_index + 1;
+            task->image_processing_parameters = image_processing_parameters;
+            task->image_processing_function = image_processing_function;
+            task->pass = pass;
             task->next_task = NULL;
-
-            if (!pool->first_task) {
-                pool->first_task = task;
-            }
-
-            if (pool->last_task) {
-                pool->last_task->next_task =
-                    task;
-            }
-
-            pool->last_task = task;
-            pool->size++;
+            pthread_mutex_lock(&pool_mutex);
+            pool_push(task);
+            pthread_cond_broadcast(&is_pool_empty_cond);
+            pthread_mutex_unlock(&pool_mutex);
         }
     }
+
+    // pthread_exit(NULL);
+    // TODO
+
+    // while (pool->size <= 0) {
+    //     pthread_cond_wait(&is_last_row_completed_cond, &pool_mutex);
+    // }
+    pthread_exit(0);
 }
 
 void ips_set_brightness_and_contrast(ips_task_t *task)
 {
     png_uint_32 x, y;
     png_bytep source_pixel, destination_pixel;
-
     int channel;
 
-    ips_raw_image_t *input_image =
-        task->input_image;
-    ips_raw_image_t *output_image =
-        task->output_image;
-    float new_image_brightness =
-        ((float *) task->image_processing_parameters)[0];
-    float new_image_contrast =
-        ((float *) task->image_processing_parameters)[1];
-    unsigned int channels =
-        output_image->channels;
+    ips_raw_image_t *input_image = task->input_image;
+    ips_raw_image_t *output_image = task->output_image;
+    float new_image_brightness = ((float *) task->image_processing_parameters)[0];
+    float new_image_contrast = ((float *) task->image_processing_parameters)[1];
+    unsigned int channels = output_image->channels;
 
     for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
         for (x = 0; x < output_image->width; ++x) {
             source_pixel = &(input_image->rows[y][x * channels]);
             destination_pixel = &(output_image->rows[y][x * channels]);
             for (channel = 0; channel < 3; ++channel) {
-                float newValue =
-                    new_image_contrast * source_pixel[channel] + new_image_brightness;
-                newValue =
-                    IPS_CLAMP(newValue, 0.0f, 255.0f);
+                float newValue = new_image_contrast * source_pixel[channel] + new_image_brightness;
+                newValue = IPS_CLAMP(newValue, 0.0f, 255.0f);
 
-                minimum_channel_value =
-                    fmin(maximum_channel_value, newValue);
-                maximum_channel_value =
-                    fmax(maximum_channel_value, newValue);
+                minimum_channel_value = fmin(minimum_channel_value, newValue);
+                maximum_channel_value = fmax(maximum_channel_value, newValue);
 
-                destination_pixel[channel] =
-                    (png_byte) newValue;
+                destination_pixel[channel] = (png_byte) newValue;
             }
         }
     }
@@ -285,7 +311,37 @@ void ips_set_brightness_and_contrast(ips_task_t *task)
     free(task);
 }
 
-/* TODO: add a Sobel filter */
+void ips_set_sobel_filter(ips_task_t *task)
+{
+    png_uint_32 x, y;
+    png_bytep source_pixel, destination_pixel;
+    int channel;
+
+    ips_raw_image_t *input_image = task->input_image;
+    ips_raw_image_t *output_image = task->output_image;
+    float new_image_brightness = ((float *) task->image_processing_parameters)[0];
+    float new_image_contrast = ((float *) task->image_processing_parameters)[1];
+    unsigned int channels = output_image->channels;
+
+    for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
+        for (x = 0; x < output_image->width; ++x) {
+            source_pixel = &(input_image->rows[y][x * channels]);
+            destination_pixel = &(output_image->rows[y][x * channels]);
+            for (channel = 0; channel < 3; ++channel) {
+                float newValue = new_image_contrast * source_pixel[channel] + new_image_brightness;
+                newValue = IPS_CLAMP(newValue, 0.0f, 255.0f);
+
+                minimum_channel_value = fmin(minimum_channel_value, newValue);
+                maximum_channel_value = fmax(maximum_channel_value, newValue);
+
+                destination_pixel[channel] = (png_byte) newValue;
+            }
+        }
+    }
+
+    free(task);
+}
+
 
 /* Image processing tasks for each consumer thread. */
 void *ips_thread_process_image_part(void *args)
@@ -293,19 +349,21 @@ void *ips_thread_process_image_part(void *args)
     ips_task_pool_t *pool = (ips_task_pool_t *) args;
     ips_task_t *task;
 
-    while (pool->size != 0) {
-        if (pool->size > 0) {
-            // Get a new task
-
-            task = pool->first_task;
-            pool->first_task = task->next_task;
-            pool->size--;
-            if (!pool->size) {
-                pool->last_task = NULL;
-            }
-
-            task->image_processing_function(task);
+    for (;;) {
+        pthread_mutex_lock(&pool_mutex);
+        while (!pool->first_task) {
+            pthread_cond_wait(&is_pool_empty_cond, &pool_mutex);
         }
+
+        pool_pop();
+
+        // if(pool->size) {
+        //     printf("3\n" );
+        //     pthread_cond_broadcast(&is_last_row_completed_cond);
+        // }
+        pthread_mutex_unlock(&pool_mutex);
+
+        task->image_processing_function(task);
     }
 
     return NULL;
@@ -321,7 +379,6 @@ void ips_init_gl_window()
         fprintf(stderr, "SDL initialization failure: \"%s\"\n", SDL_GetError());
 
         SDL_Quit();
-
         exit(EXIT_FAILURE);
     }
 
@@ -342,7 +399,6 @@ void ips_init_gl_window()
         );
 
         SDL_Quit();
-
         exit(EXIT_FAILURE);
     }
 
@@ -379,7 +435,6 @@ void ips_init_gl_window()
 
         SDL_DestroyWindow(program_window);
         SDL_Quit();
-
         exit(EXIT_FAILURE);
     }
 
@@ -497,8 +552,7 @@ GLuint ips_compile_shader(
 {
     GLint status;
 
-    GLuint shader_object =
-        glCreateShader(shader_type);
+    GLuint shader_object = glCreateShader(shader_type);
 
     glShaderSource(
         shader_object,
@@ -655,8 +709,7 @@ GLuint ips_generate_quad_geometry()
         GL_STATIC_DRAW
     );
 
-    GLsizei stride =
-        sizeof(GLfloat) * 9;
+    GLsizei stride = sizeof(GLfloat) * 9;
 
     glEnableVertexAttribArray(position_attribute_location);
     glVertexAttribPointer(
@@ -724,16 +777,12 @@ do {                                           \
 
     input_image_file = fopen(png_file_path, "rb");
     if (!input_image_file) {
-        IPS_ERROR(
-            "failed to open the input image"
-        );
+        IPS_ERROR("failed to open the input image");
     }
 
     fread(input_image_header, 1, sizeof(input_image_header), input_image_file);
     if (png_sig_cmp(input_image_header, 0, sizeof(input_image_header))) {
-        IPS_ERROR(
-            "input file is not a valid PNG file"
-        );
+        IPS_ERROR("input file is not a valid PNG file");
     }
 
     png_input_image_struct =
@@ -743,9 +792,7 @@ do {                                           \
         );
 
     if (!png_input_image_struct) {
-        IPS_ERROR(
-            "internal error: libpng: read structure was not created"
-        );
+        IPS_ERROR("internal error: libpng: read structure was not created");
     }
 
     png_input_image_info = png_create_info_struct(png_input_image_struct);
@@ -757,9 +804,7 @@ do {                                           \
     }
 
     if (setjmp(png_jmpbuf(png_input_image_struct))) {
-        IPS_ERROR(
-            "failed to read the image"
-        );
+        IPS_ERROR("failed to read the image");
     }
 
     png_init_io(
@@ -789,17 +834,13 @@ do {                                           \
     );
 
     if (input_image_interlace_type != PNG_INTERLACE_NONE) {
-        IPS_ERROR(
-            "interlaced images are not supported"
-        );
+        IPS_ERROR("interlaced images are not supported");
     }
 
     if ((input_image_color_type != PNG_COLOR_TYPE_RGB &&
          input_image_color_type != PNG_COLOR_TYPE_RGBA) ||
             input_image_bit_depth != 8) {
-        IPS_ERROR(
-            "only RGB or RGBA 8-bit images can be processed"
-        );
+        IPS_ERROR("only RGB or RGBA 8-bit images can be processed");
     }
 
     if (input_image_color_type == PNG_COLOR_TYPE_RGBA) {
@@ -813,20 +854,17 @@ do {                                           \
             png_input_image_info
         );
 
-    image_data =
-        (png_bytep) png_malloc(
-                        png_input_image_struct,
-                        input_image_height * image_row_size
-                    );
-    image_rows =
-        (png_bytepp) png_malloc(
-                         png_input_image_struct,
-                         input_image_height * sizeof(png_bytep)
-                     );
+    image_data = (png_bytep) png_malloc(
+                     png_input_image_struct,
+                     input_image_height * image_row_size
+                 );
+    image_rows = (png_bytepp) png_malloc(
+                     png_input_image_struct,
+                     input_image_height * sizeof(png_bytep)
+                 );
 
     for (i = 0; i < input_image_height; ++i) {
-        image_rows[input_image_height - i - 1] =
-            image_data + i * image_row_size;
+        image_rows[input_image_height - i - 1] = image_data + i * image_row_size;
     }
 
     png_read_image(
@@ -836,14 +874,10 @@ do {                                           \
 
 cleanup:
     if (status) {
-        result->data =
-            image_data;
-        result->rows =
-            image_rows;
-        result->width =
-            input_image_width;
-        result->height =
-            input_image_height;
+        result->data = image_data;
+        result->rows = image_rows;
+        result->width = input_image_width;
+        result->height = input_image_height;
     } else {
         if (result) {
             free(result);
@@ -911,34 +945,23 @@ ips_raw_image_t *ips_duplicate_image(ips_raw_image_t *image)
 
         data = image->data;
         if (data) {
-            width =
-                image->width;
-            height =
-                image->height;
-            channels =
-                image->channels;
-            image_row_size =
-                width * sizeof(*data) * channels;
-            image_size =
-                height * image_row_size;
+            width = image->width;
+            height = image->height;
+            channels = image->channels;
+            image_row_size = width * sizeof(*data) * channels;
+            image_size = height * image_row_size;
 
-            duplicate_data = duplicate->data =
-                (png_bytep) malloc(image_size);
-            duplicate_rows = duplicate->rows =
-                (png_bytepp) malloc(height * sizeof(*duplicate_rows));
+            duplicate_data = duplicate->data = (png_bytep) malloc(image_size);
+            duplicate_rows = duplicate->rows = (png_bytepp) malloc(height * sizeof(*duplicate_rows));
 
             memcpy(duplicate_data, data, image_size);
             for (i = 0; i < height; ++i) {
-                duplicate_rows[height - i - 1] =
-                    duplicate_data + i * image_row_size;
+                duplicate_rows[height - i - 1] = duplicate_data + i * image_row_size;
             }
 
-            duplicate->width =
-                width;
-            duplicate->height =
-                height;
-            duplicate->channels =
-                channels;
+            duplicate->width = width;
+            duplicate->height = height;
+            duplicate->channels = channels;
         }
     }
 
@@ -1017,8 +1040,7 @@ void ips_delete_texture(GLuint texture)
 
 void ips_update_model_matrix(ips_raw_image *image)
 {
-    model_matrix =
-        glm::scale(1.0f, (float) image->height / image->width, 1.0f);
+    model_matrix = glm::scale(1.0f, (float) image->height / image->width, 1.0f);
 
     ips_update_matrices(
             Initial_Window_Width,
@@ -1031,28 +1053,24 @@ void ips_update_matrices(
          int window_height
      )
 {
-    view_matrix =
-        glm::lookAt<float>(
-            glm::vec3(camera_x, camera_y, -1),
-            glm::vec3(camera_x, camera_y, 0),
-            glm::vec3(0, 1, 0)
-        );
+    view_matrix = glm::lookAt<float>(
+                      glm::vec3(camera_x, camera_y, -1),
+                      glm::vec3(camera_x, camera_y, 0),
+                      glm::vec3(0, 1, 0)
+                  );
 
-    float aspect_ration =
-        fabsf(
-            (float) window_width /
-                (float) window_height
-        );
+    float aspect_ration = fabsf(
+                              (float) window_width /
+                                  (float) window_height
+                          );
 
-    projection_matrix =
-        glm::ortho<float>(
-            -(camera_zoom * aspect_ration), camera_zoom * aspect_ration,
-            -camera_zoom, camera_zoom,
-            0.1f, 100
-        );
+    projection_matrix = glm::ortho<float>(
+                            -(camera_zoom * aspect_ration), camera_zoom * aspect_ration,
+                            -camera_zoom, camera_zoom,
+                            0.1f, 100
+                        );
 
-    model_view_projection_matrix =
-        projection_matrix * view_matrix * model_matrix;
+    model_view_projection_matrix = projection_matrix * view_matrix * model_matrix;
 }
 
 void ips_render_quad(
@@ -1113,13 +1131,10 @@ void ips_measure_and_show_frame_rate()
     static char title[IPS_WINDOW_TITLE_LENGTH];
     static const char *title_format = "%s: %d X %d at %.2f FPS";
 
-    unsigned int timer_tick =
-        SDL_GetTicks();
+    unsigned int timer_tick = SDL_GetTicks();
 
-    float frame_rate =
-        1000.0f / (timer_tick - previous_timer_tick);
-    previous_timer_tick =
-        timer_tick;
+    float frame_rate = 1000.0f / (timer_tick - previous_timer_tick);
+    previous_timer_tick = timer_tick;
 
     snprintf(
         title,
@@ -1151,14 +1166,12 @@ void ips_start(char *dropped_file_path)
     ips_init_gl_window();
     ips_init_gl();
 
-    shader_program =
-        ips_create_shader_program(
-            ips_utils_read_text_file(Vertex_Shader_Path),
-            ips_utils_read_text_file(Fragment_Shader_Path)
-        );
+    shader_program = ips_create_shader_program(
+                        ips_utils_read_text_file(Vertex_Shader_Path),
+                        ips_utils_read_text_file(Fragment_Shader_Path)
+                    );
 
-    vertex_array_object =
-        ips_generate_quad_geometry();
+    vertex_array_object = ips_generate_quad_geometry();
 
     ips_create_image_processing_task_pool();
 
@@ -1237,9 +1250,9 @@ void ips_start(char *dropped_file_path)
             reset_pass_data();
 
             // Sobel
-            //
-            // ips_update_image(source_image, image, NULL, ips_apply_sobel, 1, dt);
-            // ...ips_update_image(source_image, image, NULL, ips_apply_sobel, 2, dt);
+
+            // ips_update_image(source_image, image, NULL, ips_set_sobel_filter, 1, dt);
+            // ips_update_image(source_image, image, NULL, ips_set_sobel_filter, 2, dt);
 
             static const float brightness_contrast[2] = {
                 100.0f, 2.0f
@@ -1248,13 +1261,13 @@ void ips_start(char *dropped_file_path)
 
             ips_update_image(
                 source_image, image,
-                (void *) brightness_contrast,
-                ips_set_brightness_and_contrast,
+                NULL,
+                ips_set_sobel_filter,
                 pass, dt
             );
 
             // TODO: remove before enabling threading
-            ips_thread_process_image_part(pool);
+            // ips_thread_process_image_part(pool);
 
             ips_update_texture_from_image(texture, image);
         }
@@ -1300,10 +1313,7 @@ int main(int argc, char *argv[])
     char *image_file_path = NULL; size_t length = 0;
     if (argc > 1) {
         length = strlen(argv[1]);
-        image_file_path =
-            (char *) SDL_malloc(
-                         sizeof(*image_file_path) * (length + 1)
-                     );
+        image_file_path = (char *) SDL_malloc(sizeof(*image_file_path) * (length + 1));
         strncpy(image_file_path, argv[1], length);
         image_file_path[length] = '\0';
     }
