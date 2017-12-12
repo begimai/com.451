@@ -101,10 +101,8 @@ typedef struct ips_task_pool
 void ips_init_gl_window(void);
 void ips_init_gl(void);
 
-GLuint ips_create_shader_program(char *vertex_shader_source,
-                                 char *fragment_shader_source);
-GLuint ips_link_shader_program(GLuint vertex_shader_object,
-                               GLuint fragment_shader_object);
+GLuint ips_create_shader_program(char *vertex_shader_source, char *fragment_shader_source);
+GLuint ips_link_shader_program(GLuint vertex_shader_object, GLuint fragment_shader_object);
 GLuint ips_compile_shader(char *shader_source, GLenum shader_type);
 void ips_delete_shader_program(GLuint shader_program);
 
@@ -116,7 +114,8 @@ void ips_delete_image(ips_raw_image_t *image);
 
 void reset_pass_data(void);
 void pool_push(ips_task_t *task);
-void pool_pop(void);
+void *pool_pop(void);
+bool pool_is_empty(void);
 void ips_update_image_data(ips_raw_image_t *image, float dt);
 void ips_create_image_processing_task_pool();
 void *ips_thread_process_image_part(void *args);
@@ -179,7 +178,7 @@ static float maximum_channel_value = 0.0f;
 static ips_task_pool_t *pool;
 static int number_of_threads = 0;
 static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t is_pool_empty_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t pool_is_empty_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t is_last_row_completed_cond = PTHREAD_COND_INITIALIZER;
 
 #pragma mark - Function Definitions
@@ -216,7 +215,6 @@ void reset_pass_data()
 
 void pool_push(ips_task_t *task)
 {
-    printf("push\n");
     if (!pool->first_task) {
         pool->first_task = task;
     }
@@ -225,20 +223,25 @@ void pool_push(ips_task_t *task)
         pool->last_task->next_task = task;
     }
 
-    // pool->last_task = task;
+    pool->last_task = task;
     pool->size++;
 }
 
 
-void pool_pop()
+void *pool_pop()
 {
-    printf("pop\n");
     ips_task_t *task = pool->first_task;
     pool->first_task = task->next_task;
     pool->size--;
-    if (!pool->size) {
+    if (pool->size == 0) {
         pool->last_task = NULL;
     }
+
+    return task;
+}
+
+bool pool_is_empty() {
+  return pool->size == 0;
 }
 
 /* Producer tasks: called each time before rendering a frame. */
@@ -266,7 +269,7 @@ void ips_update_image(
             task->next_task = NULL;
             pthread_mutex_lock(&pool_mutex);
             pool_push(task);
-            pthread_cond_broadcast(&is_pool_empty_cond);
+            pthread_cond_broadcast(&pool_is_empty_cond);
             pthread_mutex_unlock(&pool_mutex);
         }
     }
@@ -274,10 +277,9 @@ void ips_update_image(
     // pthread_exit(NULL);
     // TODO
 
-    // while (pool->size <= 0) {
-    //     pthread_cond_wait(&is_last_row_completed_cond, &pool_mutex);
-    // }
-    pthread_exit(0);
+    while (pool_is_empty()) {
+        pthread_cond_wait(&is_last_row_completed_cond, &pool_mutex);
+    }
 }
 
 void ips_set_brightness_and_contrast(ips_task_t *task)
@@ -313,33 +315,33 @@ void ips_set_brightness_and_contrast(ips_task_t *task)
 
 void ips_set_sobel_filter(ips_task_t *task)
 {
-    png_uint_32 x, y;
-    png_bytep source_pixel, destination_pixel;
-    int channel;
+      png_uint_32 x, y;
+      png_bytep source_pixel, destination_pixel;
+      int channel;
 
-    ips_raw_image_t *input_image = task->input_image;
-    ips_raw_image_t *output_image = task->output_image;
-    float new_image_brightness = ((float *) task->image_processing_parameters)[0];
-    float new_image_contrast = ((float *) task->image_processing_parameters)[1];
-    unsigned int channels = output_image->channels;
+      ips_raw_image_t *input_image = task->input_image;
+      ips_raw_image_t *output_image = task->output_image;
+      float new_image_brightness = ((float *) task->image_processing_parameters)[0];
+      float new_image_contrast = ((float *) task->image_processing_parameters)[1];
+      unsigned int channels = output_image->channels;
 
-    for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
-        for (x = 0; x < output_image->width; ++x) {
-            source_pixel = &(input_image->rows[y][x * channels]);
-            destination_pixel = &(output_image->rows[y][x * channels]);
-            for (channel = 0; channel < 3; ++channel) {
-                float newValue = new_image_contrast * source_pixel[channel] + new_image_brightness;
-                newValue = IPS_CLAMP(newValue, 0.0f, 255.0f);
+      for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
+          for (x = 0; x < output_image->width; ++x) {
+              source_pixel = &(input_image->rows[y][x * channels]);
+              destination_pixel = &(output_image->rows[y][x * channels]);
+              for (channel = 0; channel < 3; ++channel) {
+                  float newValue = new_image_contrast * source_pixel[channel] + new_image_brightness;
+                  newValue = IPS_CLAMP(newValue, 0.0f, 255.0f);
 
-                minimum_channel_value = fmin(minimum_channel_value, newValue);
-                maximum_channel_value = fmax(maximum_channel_value, newValue);
+                  minimum_channel_value = fmin(minimum_channel_value, newValue);
+                  maximum_channel_value = fmax(maximum_channel_value, newValue);
 
-                destination_pixel[channel] = (png_byte) newValue;
-            }
-        }
-    }
+                  destination_pixel[channel] = (png_byte) newValue;
+              }
+          }
+      }
 
-    free(task);
+      free(task);
 }
 
 
@@ -351,16 +353,15 @@ void *ips_thread_process_image_part(void *args)
 
     for (;;) {
         pthread_mutex_lock(&pool_mutex);
-        while (!pool->first_task) {
-            pthread_cond_wait(&is_pool_empty_cond, &pool_mutex);
+        while (pool_is_empty()) {
+            pthread_cond_wait(&pool_is_empty_cond, &pool_mutex);
         }
 
-        pool_pop();
+        task = (ips_task_t *) pool_pop();
 
-        // if(pool->size) {
-        //     printf("3\n" );
-        //     pthread_cond_broadcast(&is_last_row_completed_cond);
-        // }
+        if(pool_is_empty()) {
+            pthread_cond_broadcast(&is_last_row_completed_cond);
+        }
         pthread_mutex_unlock(&pool_mutex);
 
         task->image_processing_function(task);
@@ -1261,7 +1262,7 @@ void ips_start(char *dropped_file_path)
 
             ips_update_image(
                 source_image, image,
-                NULL,
+                (void *) brightness_contrast,
                 ips_set_sobel_filter,
                 pass, dt
             );
