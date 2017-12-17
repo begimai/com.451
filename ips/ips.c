@@ -63,6 +63,13 @@ static const float Initial_Camera_Zoom = 0.8f,
                    Camera_Speed = 0.01f,
                    Camera_Minimum_Zoom = 0.01f;
 
+float kernelx[3][3] = {{-1, 0, 1},
+                      {-2, 0, 2},
+                      {-1, 0, 1}};
+
+float kernely[3][3] = {{-1, -2, -1},
+                      {0,  0,  0},
+                      {1,  2,  1}};
 
 #pragma mark - Data Types
 
@@ -274,9 +281,6 @@ void ips_update_image(
         }
     }
 
-    // pthread_exit(NULL);
-    // TODO
-
     while (pool_is_empty()) {
         pthread_cond_wait(&is_last_row_completed_cond, &pool_mutex);
     }
@@ -315,29 +319,71 @@ void ips_set_brightness_and_contrast(ips_task_t *task)
 
 void ips_set_sobel_filter(ips_task_t *task)
 {
+    png_uint_32 x, y;
+    png_bytep source_pixel, destination_pixel;
+    int channel, value;
+    int pixels[9];
+    float x_weight, y_weight;
+
+    ips_raw_image_t *input_image = task->input_image;
+    ips_raw_image_t *output_image = task->output_image;
+    unsigned int channels = output_image->channels;
+
+    for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
+        for (x = 0; x < output_image->width; ++x) {
+      	    source_pixel = &(input_image->rows[y][x * channels]);
+            destination_pixel = &(output_image->rows[y][x * channels]);
+
+            if (x == 0 || y == 0 || x == input_image->width - 1 || y == input_image->height - 1)
+            {
+                destination_pixel[0] = destination_pixel[1] = destination_pixel[2] = 0;
+            }
+            else {
+                pixels[0] = input_image->rows[y-1][(x-1) * channels];
+                pixels[1] = input_image->rows[y][(x-1) * channels];
+                pixels[2] = input_image->rows[y+1][(x-1) * channels];
+                pixels[3] = input_image->rows[y-1][x * channels];
+                pixels[4] = input_image->rows[y][x * channels];
+                pixels[5] = input_image->rows[y+1][x * channels];
+                pixels[6] = input_image->rows[y-1][(x+1) * channels];
+                pixels[7] = input_image->rows[y][(x+1) * channels];
+                pixels[8] = input_image->rows[y+1][(x+1) * channels];
+
+                x_weight = (kernelx[0][0] * pixels[0]) + (kernelx[0][1] * pixels[1]) + (kernelx[0][2] * pixels[2]) +
+                           (kernelx[1][0] * pixels[3]) + (kernelx[1][1] * pixels[4]) + (kernelx[1][2] * pixels[5]) +
+                           (kernelx[2][0] * pixels[6]) + (kernelx[2][1] * pixels[7]) + (kernelx[2][2] * pixels[8]);
+                y_weight = (kernely[0][0] * pixels[0]) + (kernely[0][1] * pixels[1]) + (kernely[0][2] * pixels[2]) +
+                           (kernely[1][0] * pixels[3]) + (kernely[1][1] * pixels[4]) + (kernely[1][2] * pixels[5]) +
+                           (kernely[2][0] * pixels[6]) + (kernely[2][1] * pixels[7]) + (kernely[2][2] * pixels[8]);
+
+                value = abs(x_weight) + abs(y_weight);
+                value = IPS_CLAMP(value, 0.0f, 255.0f);
+                destination_pixel[0] = destination_pixel[1] = destination_pixel[2] = value;
+
+            }
+        }
+    }
+    free(task);
+}
+
+void ips_set_black_and_white(ips_task_t *task)
+{
       png_uint_32 x, y;
       png_bytep source_pixel, destination_pixel;
       int channel;
 
       ips_raw_image_t *input_image = task->input_image;
       ips_raw_image_t *output_image = task->output_image;
-      float new_image_brightness = ((float *) task->image_processing_parameters)[0];
-      float new_image_contrast = ((float *) task->image_processing_parameters)[1];
       unsigned int channels = output_image->channels;
 
       for (y = task->row_index_to_process; y < task->last_row_index_to_process; ++y) {
           for (x = 0; x < output_image->width; ++x) {
               source_pixel = &(input_image->rows[y][x * channels]);
               destination_pixel = &(output_image->rows[y][x * channels]);
-              for (channel = 0; channel < 3; ++channel) {
-                  float newValue = new_image_contrast * source_pixel[channel] + new_image_brightness;
-                  newValue = IPS_CLAMP(newValue, 0.0f, 255.0f);
-
-                  minimum_channel_value = fmin(minimum_channel_value, newValue);
-                  maximum_channel_value = fmax(maximum_channel_value, newValue);
-
-                  destination_pixel[channel] = (png_byte) newValue;
-              }
+              float newValue = source_pixel[0] * 0.299 + source_pixel[1] * 0.587 + source_pixel[2] * 0.114 ;
+              destination_pixel[0] = (png_byte) newValue;
+              destination_pixel[1] = (png_byte) newValue;
+              destination_pixel[2] = (png_byte) newValue;
           }
       }
 
@@ -1249,11 +1295,7 @@ void ips_start(char *dropped_file_path)
 
         if (source_image && image) {
             reset_pass_data();
-
             // Sobel
-
-            // ips_update_image(source_image, image, NULL, ips_set_sobel_filter, 1, dt);
-            // ips_update_image(source_image, image, NULL, ips_set_sobel_filter, 2, dt);
 
             static const float brightness_contrast[2] = {
                 100.0f, 2.0f
@@ -1262,7 +1304,7 @@ void ips_start(char *dropped_file_path)
 
             ips_update_image(
                 source_image, image,
-                (void *) brightness_contrast,
+                NULL,
                 ips_set_sobel_filter,
                 pass, dt
             );
