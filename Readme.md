@@ -1,4 +1,4 @@
-ips
+ips Sobel Filter with mutexes
 ===
 
 *ips* is a test bed environment to design and test various image processing
